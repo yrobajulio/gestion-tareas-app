@@ -239,17 +239,6 @@ def login_page() -> None:
         
         st.markdown("</div>", unsafe_allow_html=True)
         
-        # Información de usuarios demo
-        with st.expander("ℹ️ Usuarios de prueba"):
-            st.caption("**Jefes de Proyecto:**")
-            st.caption("• julio.yroba / jefe123")
-            st.caption("• jose.quintero / jefe123")
-            st.caption("• matias.riquelme / jefe123")
-            st.caption("")
-            st.caption("**Gerencia:**")
-            st.caption("• gerente.proyectos / gerente123")
-            st.caption("• gerente.general / admin123")
-
 
 def logout() -> None:
     """Cerrar sesión"""
@@ -759,6 +748,100 @@ def jp_view(nombre: str, df: pd.DataFrame) -> None:
                 f"⏰ Días de atraso: <strong>{days}</strong> · Autor: {row['autor']} · Cliente: {row['cliente']}</div>",
                 unsafe_allow_html=True,
             )
+            
+            # Controles interactivos para tareas atrasadas
+            col1, col2, col3 = st.columns([2, 1, 1])
+            
+            with col1:
+                new_status = st.selectbox(
+                    f"Estado",
+                    options=ESTADOS,
+                    index=ESTADOS.index(row["estado"]),
+                    key=f"status_late_{nombre}_{row['id']}",
+                )
+                if new_status != row["estado"]:
+                    if update_task_in_db(int(row["id"]), {"estado": new_status}):
+                        st.success("Estado actualizado")
+                        refresh_tasks()
+                        st.rerun()
+            
+            with col2:
+                if puede_editar_tarea(row.to_dict()):
+                    if st.button("✏️ Editar", key=f"edit_btn_late_{row['id']}"):
+                        st.session_state[f"editing_late_{row['id']}"] = True
+                        st.rerun()
+            
+            with col3:
+                if puede_eliminar_tarea(row.to_dict()):
+                    if st.button("🗑️ Eliminar", key=f"del_btn_late_{row['id']}"):
+                        if st.session_state.get(f"confirm_del_late_{row['id']}"):
+                            if delete_task_from_db(int(row['id'])):
+                                st.session_state.pop(f"confirm_del_late_{row['id']}")
+                                st.success("Tarea eliminada")
+                                refresh_tasks()
+                                st.rerun()
+                        else:
+                            st.session_state[f"confirm_del_late_{row['id']}"] = True
+                            st.warning("⚠️ Presiona de nuevo para confirmar")
+            
+            # EDICIÓN DE TAREA ATRASADA
+            if st.session_state.get(f"editing_late_{row['id']}") and puede_editar_tarea(row.to_dict()):
+                with st.expander("✏️ Editar tarea", expanded=True):
+                    new_desc = st.text_area("Descripción", value=row['descripcion'], key=f"desc_late_{row['id']}")
+                    new_cliente = st.text_input("Cliente", value=row['cliente'], key=f"cliente_late_{row['id']}")
+                    new_date = st.date_input("Fecha objetivo", value=row['fecha_objetivo'], key=f"date_late_{row['id']}")
+                    new_asignado = st.selectbox("Asignado", JEFES_PROYECTO, 
+                                               index=JEFES_PROYECTO.index(row['asignado']) if row['asignado'] in JEFES_PROYECTO else 0, 
+                                               key=f"asig_late_{row['id']}")
+                    
+                    col_save, col_cancel = st.columns(2)
+                    with col_save:
+                        if st.button("💾 Guardar cambios", key=f"save_late_{row['id']}"):
+                            updates = {
+                                'descripcion': new_desc,
+                                'cliente': new_cliente,
+                                'fecha_objetivo': new_date,
+                                'asignado': new_asignado
+                            }
+                            if update_task_in_db(int(row['id']), updates):
+                                st.session_state.pop(f"editing_late_{row['id']}")
+                                st.success("Cambios guardados")
+                                refresh_tasks()
+                                st.rerun()
+                    
+                    with col_cancel:
+                        if st.button("❌ Cancelar", key=f"cancel_late_{row['id']}"):
+                            st.session_state.pop(f"editing_late_{row['id']}")
+                            st.rerun()
+            
+            # COMENTARIOS EN TAREAS ATRASADAS
+            task = next((t for t in st.session_state.tasks if t['id'] == int(row['id'])), None)
+            if task and task.get('comentarios'):
+                with st.expander(f"💬 Comentarios ({len(task['comentarios'])})"):
+                    for com in task['comentarios']:
+                        com_date = datetime.fromisoformat(com['fecha']).strftime("%d/%m/%Y %H:%M")
+                        st.caption(f"**{com['autor']}** - {com_date}")
+                        st.write(com['texto'])
+                        st.divider()
+            
+            # Agregar comentario a tarea atrasada
+            with st.expander("➕ Agregar comentario"):
+                comment_text = st.text_area("Comentario", key=f"comment_late_{row['id']}")
+                if st.button("Publicar", key=f"post_comment_late_{row['id']}"):
+                    if comment_text.strip():
+                        task = next((t for t in st.session_state.tasks if t['id'] == int(row['id'])), None)
+                        if task:
+                            if 'comentarios' not in task:
+                                task['comentarios'] = []
+                            task['comentarios'].append({
+                                'autor': st.session_state.user_info["nombre"],
+                                'fecha': datetime.now().isoformat(),
+                                'texto': comment_text.strip()
+                            })
+                            if update_task_in_db(int(row['id']), {'comentarios': task['comentarios']}):
+                                st.success("Comentario agregado")
+                                refresh_tasks()
+                                st.rerun()
 
 
 # ============================================================================
