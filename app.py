@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import date, datetime, timedelta
 from io import BytesIO
 import json
+import hashlib
 
 import altair as alt
 import pandas as pd
@@ -51,6 +52,15 @@ USUARIOS = {
 JEFES_PROYECTO = ["Julio Yroba", "José Quintero", "Matías Riquelme"]
 ESTADOS = ["Pendiente", "En Proceso", "Completada"]
 
+# Metas de KPIs
+METAS_KPI = {
+    "felicitaciones": 2,
+    "reclamos": 1,
+    "orden": 90,
+    "respuesta_cliente": 95,
+    "autonomia": 85
+}
+
 # ============================================================================
 # CONEXIÓN A SUPABASE
 # ============================================================================
@@ -68,7 +78,7 @@ def get_supabase_client() -> Client:
 
 
 # ============================================================================
-# FUNCIONES DE BASE DE DATOS
+# FUNCIONES DE BASE DE DATOS - TAREAS
 # ============================================================================
 
 def load_tasks_from_db() -> list:
@@ -120,11 +130,9 @@ def update_task_in_db(task_id: int, updates: dict) -> bool:
     try:
         supabase = get_supabase_client()
         
-        # Convertir fecha a string si existe
         if "fecha_objetivo" in updates and isinstance(updates["fecha_objetivo"], date):
             updates["fecha_objetivo"] = updates["fecha_objetivo"].isoformat()
         
-        # Convertir comentarios a JSON si existe
         if "comentarios" in updates:
             updates["comentarios"] = json.dumps(updates["comentarios"], ensure_ascii=False)
         
@@ -147,15 +155,167 @@ def delete_task_from_db(task_id: int) -> bool:
 
 
 # ============================================================================
+# FUNCIONES DE BASE DE DATOS - KPIs
+# ============================================================================
+
+def save_kpi_to_db(kpi_data: dict) -> bool:
+    """Guardar KPI en Supabase"""
+    try:
+        supabase = get_supabase_client()
+        supabase.table("kpis").insert(kpi_data).execute()
+        return True
+    except Exception as e:
+        st.error(f"Error guardando KPI: {e}")
+        return False
+
+
+def load_kpis_from_db(start_date: date = None, end_date: date = None) -> pd.DataFrame:
+    """Cargar KPIs desde Supabase"""
+    try:
+        supabase = get_supabase_client()
+        query = supabase.table("kpis").select("*")
+        
+        if start_date:
+            query = query.gte("semana", start_date.isoformat())
+        if end_date:
+            query = query.lte("semana", end_date.isoformat())
+        
+        response = query.order("semana", desc=True).execute()
+        
+        if response.data:
+            df = pd.DataFrame(response.data)
+            df['semana'] = pd.to_datetime(df['semana']).dt.date
+            return df
+        return pd.DataFrame()
+    except Exception as e:
+        st.error(f"Error cargando KPIs: {e}")
+        return pd.DataFrame()
+
+
+def calcular_autonomia(persona: str, semana_inicio: date, semana_fin: date) -> float:
+    """Calcular KPI de autonomía basado en tareas"""
+    try:
+        df = to_df()
+        if df.empty:
+            return 0.0
+        
+        # Filtrar tareas de la semana y persona
+        mask = (
+            (df['asignado'] == persona) &
+            (df['fecha_objetivo'] >= semana_inicio) &
+            (df['fecha_objetivo'] <= semana_fin)
+        )
+        tareas_semana = df[mask]
+        
+        if len(tareas_semana) == 0:
+            return 0.0
+        
+        # Calcular completadas
+        completadas = len(tareas_semana[tareas_semana['estado'] == 'Completada'])
+        total = len(tareas_semana)
+        
+        return round((completadas / total) * 100, 2)
+    except Exception as e:
+        st.error(f"Error calculando autonomía: {e}")
+        return 0.0
+
+
+def calcular_cumplimiento_kpi(kpi_row: dict) -> float:
+    """Calcular el cumplimiento general del KPI"""
+    cumplimientos = []
+    
+    # Felicitaciones (mayor es mejor, meta >2)
+    if kpi_row['felicitaciones'] >= METAS_KPI['felicitaciones']:
+        cumplimientos.append(100)
+    else:
+        cumplimientos.append((kpi_row['felicitaciones'] / METAS_KPI['felicitaciones']) * 100)
+    
+    # Reclamos (menor es mejor, meta <1)
+    if kpi_row['reclamos'] <= METAS_KPI['reclamos']:
+        cumplimientos.append(100)
+    else:
+        cumplimientos.append(max(0, 100 - (kpi_row['reclamos'] - METAS_KPI['reclamos']) * 50))
+    
+    # Orden, Respuesta Cliente, Autonomía (mayor es mejor)
+    for campo in ['orden', 'respuesta_cliente', 'autonomia']:
+        if kpi_row[campo] >= METAS_KPI[campo]:
+            cumplimientos.append(100)
+        else:
+            cumplimientos.append((kpi_row[campo] / METAS_KPI[campo]) * 100)
+    
+    return round(sum(cumplimientos) / len(cumplimientos), 2)
+
+
+# ============================================================================
 # FUNCIONES DE AUTENTICACIÓN
 # ============================================================================
 
+def hash_password(password: str) -> str:
+    """Generar hash simple de contraseña (SHA-256)"""
+    return hashlib.sha256(password.encode()).hexdigest()
+
+
+def verificar_credenciales_db(username: str, password: str) -> dict | None:
+    """Verificar credenciales contra Supabase"""
+    try:
+        supabase = get_supabase_client()
+        response = supabase.table("usuarios").select("*").eq("username", username).execute()
+        
+        if response.data and len(response.data) > 0:
+            user = response.data[0]
+            stored_password = user['password_hash']
+            
+            # Si la contraseña almacenada no está hasheada (texto plano), hashearla
+            if len(stored_password) < 64:  # No es un hash SHA-256
+                if stored_password == password:
+                    # Actualizar a hash
+                    new_hash = hash_password(password)
+                    supabase.table("usuarios").update({"password_hash": new_hash}).eq("username", username).execute()
+                    return {
+                        "nombre": user['nombre'],
+                        "rol": user['rol']
+                    }
+            else:
+                # Ya está hasheada, comparar hashes
+                if stored_password == hash_password(password):
+                    return {
+                        "nombre": user['nombre'],
+                        "rol": user['rol']
+                    }
+        return None
+    except Exception as e:
+        st.error(f"Error verificando credenciales: {e}")
+        return None
+
+
 def verificar_credenciales(username: str, password: str) -> dict | None:
-    """Verificar credenciales de usuario"""
+    """Verificar credenciales (primero DB, luego fallback a hardcoded)"""
+    user_info = verificar_credenciales_db(username, password)
+    if user_info:
+        return user_info
+    
     if username in USUARIOS:
         if USUARIOS[username]["password"] == password:
             return USUARIOS[username]
     return None
+
+
+def cambiar_contraseña(username: str, current_password: str, new_password: str) -> tuple[bool, str]:
+    """Cambiar contraseña de usuario"""
+    try:
+        if not verificar_credenciales_db(username, current_password):
+            return False, "La contraseña actual es incorrecta"
+        
+        supabase = get_supabase_client()
+        new_hash = hash_password(new_password)
+        supabase.table("usuarios").update({
+            "password_hash": new_hash,
+            "updated_at": datetime.now().isoformat()
+        }).eq("username", username).execute()
+        
+        return True, "Contraseña actualizada exitosamente"
+    except Exception as e:
+        return False, f"Error al cambiar contraseña: {e}"
 
 
 def es_gerente() -> bool:
@@ -169,13 +329,11 @@ def puede_editar_tarea(tarea: dict) -> bool:
     """Verificar si el usuario puede editar una tarea"""
     if es_gerente():
         return True
-    # Jefes de proyecto pueden editar tareas asignadas a ellos
     return tarea["asignado"] == st.session_state.user_info["nombre"]
 
 
 def puede_eliminar_tarea(tarea: dict) -> bool:
     """Verificar si el usuario puede eliminar una tarea"""
-    # Solo gerentes pueden eliminar tareas
     return es_gerente()
 
 
@@ -238,7 +396,7 @@ def login_page() -> None:
                     st.error("❌ Usuario o contraseña incorrectos")
         
         st.markdown("</div>", unsafe_allow_html=True)
-        
+
 
 def logout() -> None:
     """Cerrar sesión"""
@@ -336,13 +494,6 @@ def inject_css() -> None:
             .chip-e { background:#663611; color:#ffd7b4; }
             .chip-c { background:#174229; color:#b4f5cf; }
             .muted { color: #9fb0d3; font-size: .9rem; }
-            .person {
-                background: #0d1324;
-                border: 1px solid #2a3a5f;
-                border-radius: 12px;
-                padding: 0.8rem;
-                min-height: unset;
-            }
             .task.available {
                 background: #064e3b;
                 color: #a7f3d0;
@@ -564,6 +715,524 @@ def dashboard_gerencia(df: pd.DataFrame) -> None:
 
 
 # ============================================================================
+# GESTIÓN DE TAREAS (GERENTES)
+# ============================================================================
+
+def gestion_tareas_gerentes(df: pd.DataFrame) -> None:
+    """Vista de gestión de tareas para gerentes"""
+    st.markdown(
+        """
+        <div class='hero'>
+            <h1>Gestión de Tareas</h1>
+            <p>Panel de administración para gerentes</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    # CREAR TAREA
+    with st.container(border=True):
+        st.subheader("📝 Crear nueva tarea")
+        with st.form("form_gerente_crear", clear_on_submit=True):
+            descripcion = st.text_area("Descripción")
+            cliente = st.text_input("Cliente")
+            fecha_objetivo = st.date_input("Fecha objetivo", value=date.today())
+            asignado = st.selectbox("Asignado a", JEFES_PROYECTO)
+            estado = st.selectbox("Estado inicial", ["Pendiente", "En Proceso"])
+            
+            if st.form_submit_button("💾 Crear tarea"):
+                if descripcion.strip() and cliente.strip():
+                    if fecha_objetivo < date.today():
+                        st.warning("⚠️ Estás creando una tarea con fecha pasada")
+                    
+                    nueva_tarea = {
+                        "descripcion": descripcion.strip(),
+                        "fecha_objetivo": fecha_objetivo,
+                        "estado": estado,
+                        "autor": st.session_state.user_info["nombre"],
+                        "asignado": asignado,
+                        "cliente": cliente.strip(),
+                        "comentarios": []
+                    }
+                    
+                    if save_task_to_db(nueva_tarea):
+                        st.success("✓ Tarea creada exitosamente")
+                        refresh_tasks()
+                        st.rerun()
+                else:
+                    st.error("❌ Descripción y cliente son obligatorios")
+    
+    # FILTROS
+    st.subheader("🔍 Filtrar tareas")
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        filtro_persona = st.selectbox("Persona", ["Todos"] + JEFES_PROYECTO)
+    with col2:
+        filtro_estado = st.selectbox("Estado", ["Todos", "Pendiente", "En Proceso", "Completada"])
+    with col3:
+        search = st.text_input("Buscar", placeholder="Cliente o descripción")
+    
+    # APLICAR FILTROS
+    filtered_df = df.copy()
+    
+    if filtro_persona != "Todos":
+        filtered_df = filtered_df[filtered_df["asignado"] == filtro_persona]
+    
+    if filtro_estado != "Todos":
+        filtered_df = filtered_df[filtered_df["estado"] == filtro_estado]
+    
+    if search:
+        mask = (
+            filtered_df['descripcion'].str.contains(search, case=False, na=False) |
+            filtered_df['cliente'].str.contains(search, case=False, na=False)
+        )
+        filtered_df = filtered_df[mask]
+    
+    # MOSTRAR TAREAS
+    st.subheader(f"📋 Tareas ({len(filtered_df)})")
+    
+    if filtered_df.empty:
+        st.info("No hay tareas que coincidan con los filtros")
+    else:
+        for _, row in filtered_df.sort_values("fecha_objetivo").iterrows():
+            task_card(row)
+            
+            col1, col2, col3 = st.columns([2, 1, 1])
+            
+            with col1:
+                new_status = st.selectbox(
+                    "Estado",
+                    options=ESTADOS,
+                    index=ESTADOS.index(row["estado"]),
+                    key=f"status_gest_{row['id']}",
+                )
+                if new_status != row["estado"]:
+                    if update_task_in_db(int(row["id"]), {"estado": new_status}):
+                        st.success("Estado actualizado")
+                        refresh_tasks()
+                        st.rerun()
+            
+            with col2:
+                if st.button("✏️ Editar", key=f"edit_btn_gest_{row['id']}"):
+                    st.session_state[f"editing_gest_{row['id']}"] = True
+                    st.rerun()
+            
+            with col3:
+                if st.button("🗑️ Eliminar", key=f"del_btn_gest_{row['id']}"):
+                    if st.session_state.get(f"confirm_del_gest_{row['id']}"):
+                        if delete_task_from_db(int(row['id'])):
+                            st.session_state.pop(f"confirm_del_gest_{row['id']}")
+                            st.success("Tarea eliminada")
+                            refresh_tasks()
+                            st.rerun()
+                    else:
+                        st.session_state[f"confirm_del_gest_{row['id']}"] = True
+                        st.warning("⚠️ Presiona de nuevo para confirmar")
+            
+            # EDICIÓN
+            if st.session_state.get(f"editing_gest_{row['id']}"):
+                with st.expander("✏️ Editar tarea", expanded=True):
+                    new_desc = st.text_area("Descripción", value=row['descripcion'], key=f"desc_gest_{row['id']}")
+                    new_cliente = st.text_input("Cliente", value=row['cliente'], key=f"cliente_gest_{row['id']}")
+                    new_date = st.date_input("Fecha objetivo", value=row['fecha_objetivo'], key=f"date_gest_{row['id']}")
+                    new_asignado = st.selectbox("Asignado", JEFES_PROYECTO, 
+                                               index=JEFES_PROYECTO.index(row['asignado']) if row['asignado'] in JEFES_PROYECTO else 0, 
+                                               key=f"asig_gest_{row['id']}")
+                    
+                    col_save, col_cancel = st.columns(2)
+                    with col_save:
+                        if st.button("💾 Guardar cambios", key=f"save_gest_{row['id']}"):
+                            updates = {
+                                'descripcion': new_desc,
+                                'cliente': new_cliente,
+                                'fecha_objetivo': new_date,
+                                'asignado': new_asignado
+                            }
+                            if update_task_in_db(int(row['id']), updates):
+                                st.session_state.pop(f"editing_gest_{row['id']}")
+                                st.success("Cambios guardados")
+                                refresh_tasks()
+                                st.rerun()
+                    
+                    with col_cancel:
+                        if st.button("❌ Cancelar", key=f"cancel_gest_{row['id']}"):
+                            st.session_state.pop(f"editing_gest_{row['id']}")
+                            st.rerun()
+
+
+# ============================================================================
+# KPI GERENCIAL
+# ============================================================================
+
+def kpi_gerencial() -> None:
+    """Dashboard de KPIs gerenciales"""
+    st.markdown(
+        """
+        <div class='hero'>
+            <h1>📊 KPI Gerencial</h1>
+            <p>Indicadores de desempeño del equipo</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    
+    tabs = st.tabs(["📈 Dashboard Actual", "📝 Ingresar KPIs", "📅 Histórico"])
+    
+    # TAB 1: DASHBOARD ACTUAL
+    with tabs[0]:
+        dashboard_kpi_actual()
+    
+    # TAB 2: INGRESAR KPIs
+    with tabs[1]:
+        ingresar_kpis()
+    
+    # TAB 3: HISTÓRICO
+    with tabs[2]:
+        historico_kpis()
+
+
+def dashboard_kpi_actual() -> None:
+    """Dashboard de KPIs de la semana actual"""
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())
+    sunday = monday + timedelta(days=6)
+    
+    # Cargar KPIs de la semana actual
+    kpis_df = load_kpis_from_db(monday, sunday)
+    
+    if kpis_df.empty:
+        st.warning("⚠️ No hay datos de KPI para la semana actual. Ve a 'Ingresar KPIs' para agregar datos.")
+        return
+    
+    # SECCIÓN A: RESUMEN EJECUTIVO
+    st.markdown("### 📊 Resumen Ejecutivo")
+    
+    cumplimiento_promedio = kpis_df['cumplimiento_kpi'].mean()
+    
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(
+            "Cumplimiento KPI Promedio",
+            f"{cumplimiento_promedio:.1f}%",
+            delta=f"{'✓' if cumplimiento_promedio >= 80 else '✗'} {'Excelente' if cumplimiento_promedio >= 80 else 'Mejorar'}"
+        )
+    
+    with col2:
+        personas_bajo_meta = len(kpis_df[kpis_df['cumplimiento_kpi'] < 80])
+        st.metric("Personas bajo meta", personas_bajo_meta, delta_color="inverse")
+    
+    with col3:
+        st.metric("Semana", monday.strftime("%d/%m/%Y"))
+    
+    # Alertas
+    for _, row in kpis_df.iterrows():
+        if row['autonomia'] < METAS_KPI['autonomia']:
+            st.error(f"🚨 {row['persona']}: Autonomía bajo meta ({row['autonomia']:.1f}% < {METAS_KPI['autonomia']}%)")
+        if row['reclamos'] > METAS_KPI['reclamos']:
+            st.error(f"🚨 {row['persona']}: Reclamos sobre meta ({row['reclamos']} > {METAS_KPI['reclamos']})")
+    
+    st.divider()
+    
+    # SECCIÓN B: GRÁFICOS PRINCIPALES
+    st.markdown("### 📈 Indicadores por Persona")
+    
+    col1, col2 = st.columns(2)
+    
+    with col1:
+        # Gráfico Felicitaciones
+        st.subheader("Felicitaciones")
+        chart_data = kpis_df[['persona', 'felicitaciones']].copy()
+        chart_data['Meta'] = METAS_KPI['felicitaciones']
+        chart = alt.Chart(chart_data).mark_bar().encode(
+            x=alt.X('persona:N', title=''),
+            y=alt.Y('felicitaciones:Q', title='Cantidad'),
+            color=alt.condition(
+                alt.datum.felicitaciones >= METAS_KPI['felicitaciones'],
+                alt.value('#22c55e'),
+                alt.value('#ef4444')
+            )
+        )
+        rule = alt.Chart(pd.DataFrame({'y': [METAS_KPI['felicitaciones']]})).mark_rule(color='#facc15', strokeDash=[5, 5]).encode(y='y:Q')
+        st.altair_chart(chart + rule, use_container_width=True)
+        
+        # Gráfico Orden
+        st.subheader("Orden (%)")
+        chart_data = kpis_df[['persona', 'orden']].copy()
+        chart = alt.Chart(chart_data).mark_bar().encode(
+            x=alt.X('persona:N', title=''),
+            y=alt.Y('orden:Q', title='%', scale=alt.Scale(domain=[0, 100])),
+            color=alt.condition(
+                alt.datum.orden >= METAS_KPI['orden'],
+                alt.value('#22c55e'),
+                alt.value('#ef4444')
+            )
+        )
+        rule = alt.Chart(pd.DataFrame({'y': [METAS_KPI['orden']]})).mark_rule(color='#facc15', strokeDash=[5, 5]).encode(y='y:Q')
+        st.altair_chart(chart + rule, use_container_width=True)
+        
+        # Gráfico Autonomía
+        st.subheader("Autonomía (%)")
+        chart_data = kpis_df[['persona', 'autonomia']].copy()
+        chart = alt.Chart(chart_data).mark_bar().encode(
+            x=alt.X('persona:N', title=''),
+            y=alt.Y('autonomia:Q', title='%', scale=alt.Scale(domain=[0, 100])),
+            color=alt.condition(
+                alt.datum.autonomia >= METAS_KPI['autonomia'],
+                alt.value('#22c55e'),
+                alt.value('#ef4444')
+            )
+        )
+        rule = alt.Chart(pd.DataFrame({'y': [METAS_KPI['autonomia']]})).mark_rule(color='#facc15', strokeDash=[5, 5]).encode(y='y:Q')
+        st.altair_chart(chart + rule, use_container_width=True)
+    
+    with col2:
+        # Gráfico Reclamos
+        st.subheader("Reclamos")
+        chart_data = kpis_df[['persona', 'reclamos']].copy()
+        chart = alt.Chart(chart_data).mark_bar().encode(
+            x=alt.X('persona:N', title=''),
+            y=alt.Y('reclamos:Q', title='Cantidad'),
+            color=alt.condition(
+                alt.datum.reclamos <= METAS_KPI['reclamos'],
+                alt.value('#22c55e'),
+                alt.value('#ef4444')
+            )
+        )
+        rule = alt.Chart(pd.DataFrame({'y': [METAS_KPI['reclamos']]})).mark_rule(color='#facc15', strokeDash=[5, 5]).encode(y='y:Q')
+        st.altair_chart(chart + rule, use_container_width=True)
+        
+        # Gráfico Respuesta Cliente
+        st.subheader("Respuesta Cliente (%)")
+        chart_data = kpis_df[['persona', 'respuesta_cliente']].copy()
+        chart = alt.Chart(chart_data).mark_bar().encode(
+            x=alt.X('persona:N', title=''),
+            y=alt.Y('respuesta_cliente:Q', title='%', scale=alt.Scale(domain=[0, 100])),
+            color=alt.condition(
+                alt.datum.respuesta_cliente >= METAS_KPI['respuesta_cliente'],
+                alt.value('#22c55e'),
+                alt.value('#ef4444')
+            )
+        )
+        rule = alt.Chart(pd.DataFrame({'y': [METAS_KPI['respuesta_cliente']]})).mark_rule(color='#facc15', strokeDash=[5, 5]).encode(y='y:Q')
+        st.altair_chart(chart + rule, use_container_width=True)
+        
+        # Gráfico Cumplimiento KPI
+        st.subheader("Cumplimiento KPI (%)")
+        chart_data = kpis_df[['persona', 'cumplimiento_kpi']].copy()
+        chart = alt.Chart(chart_data).mark_bar().encode(
+            x=alt.X('persona:N', title=''),
+            y=alt.Y('cumplimiento_kpi:Q', title='%', scale=alt.Scale(domain=[0, 100])),
+            color=alt.condition(
+                alt.datum.cumplimiento_kpi >= 80,
+                alt.value('#22c55e'),
+                alt.value('#ef4444')
+            )
+        )
+        st.altair_chart(chart, use_container_width=True)
+    
+    st.divider()
+    
+    # SECCIÓN C: TABLA DETALLADA
+    st.markdown("### 📋 Tabla Detallada")
+    
+    # Preparar datos para la tabla
+    tabla_data = []
+    
+    indicadores = [
+        ("Felicitaciones", "felicitaciones", f">{METAS_KPI['felicitaciones']}"),
+        ("Reclamos", "reclamos", f"<{METAS_KPI['reclamos']}"),
+        ("Orden", "orden", f">{METAS_KPI['orden']}%"),
+        ("Autonomía", "autonomia", f">{METAS_KPI['autonomia']}%"),
+        ("Respuesta Cliente", "respuesta_cliente", f">{METAS_KPI['respuesta_cliente']}%")
+    ]
+    
+    for indicador_nombre, indicador_key, meta_str in indicadores:
+        row_data = {"Indicador": indicador_nombre, "Meta": meta_str}
+        for persona in JEFES_PROYECTO:
+            persona_data = kpis_df[kpis_df['persona'] == persona]
+            if not persona_data.empty:
+                valor = persona_data.iloc[0][indicador_key]
+                if indicador_key in ['felicitaciones', 'reclamos']:
+                    row_data[persona] = f"{valor:.0f}"
+                else:
+                    row_data[persona] = f"{valor:.0f}%"
+            else:
+                row_data[persona] = "N/A"
+        
+        # Promedio
+        promedio = kpis_df[indicador_key].mean()
+        if indicador_key in ['felicitaciones', 'reclamos']:
+            row_data["Promedio Depto"] = f"{promedio:.0f}"
+        else:
+            row_data["Promedio Depto"] = f"{promedio:.0f}%"
+        
+        tabla_data.append(row_data)
+    
+    # Fila de Cumplimiento KPI
+    cumpl_row = {"Indicador": "**Cumplimiento KPI**", "Meta": ""}
+    for persona in JEFES_PROYECTO:
+        persona_data = kpis_df[kpis_df['persona'] == persona]
+        if not persona_data.empty:
+            cumpl_row[persona] = f"**{persona_data.iloc[0]['cumplimiento_kpi']:.0f}%**"
+        else:
+            cumpl_row[persona] = "N/A"
+    cumpl_row["Promedio Depto"] = f"**{cumplimiento_promedio:.0f}%**"
+    tabla_data.append(cumpl_row)
+    
+    tabla_df = pd.DataFrame(tabla_data)
+    st.dataframe(tabla_df, hide_index=True, use_container_width=True)
+
+
+def ingresar_kpis() -> None:
+    """Formulario para ingresar KPIs semanales"""
+    st.markdown("### 📝 Ingresar KPIs Semanales")
+    
+    today = date.today()
+    monday = today - timedelta(days=today.weekday())
+    
+    st.info(f"📅 Ingresando KPIs para la semana del {monday.strftime('%d/%m/%Y')}")
+    
+    # Seleccionar persona
+    persona = st.selectbox("Selecciona persona", JEFES_PROYECTO)
+    
+    # Verificar si ya existen KPIs para esta semana y persona
+    kpis_existentes = load_kpis_from_db(monday, monday)
+    if not kpis_existentes.empty and persona in kpis_existentes['persona'].values:
+        st.warning(f"⚠️ Ya existen KPIs registrados para {persona} en esta semana. Serán reemplazados.")
+    
+    with st.form("form_kpis"):
+        st.subheader(f"KPIs para {persona}")
+        
+        felicitaciones = st.number_input(
+            f"Felicitaciones (Meta: >{METAS_KPI['felicitaciones']})",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=1.0
+        )
+        
+        reclamos = st.number_input(
+            f"Reclamos (Meta: <{METAS_KPI['reclamos']})",
+            min_value=0,
+            max_value=100,
+            value=0,
+            step=1
+        )
+        
+        orden = st.number_input(
+            f"Orden % (Meta: >{METAS_KPI['orden']}%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=1.0
+        )
+        
+        respuesta_cliente = st.number_input(
+            f"Respuesta Cliente % (Meta: >{METAS_KPI['respuesta_cliente']}%)",
+            min_value=0.0,
+            max_value=100.0,
+            value=0.0,
+            step=1.0
+        )
+        
+        # Calcular Autonomía automáticamente
+        sunday = monday + timedelta(days=6)
+        autonomia = calcular_autonomia(persona, monday, sunday)
+        st.metric("Autonomía (calculado automáticamente)", f"{autonomia}%")
+        
+        if st.form_submit_button("💾 Guardar KPIs"):
+            # Calcular cumplimiento KPI
+            kpi_data = {
+                'felicitaciones': felicitaciones,
+                'reclamos': reclamos,
+                'orden': orden,
+                'respuesta_cliente': respuesta_cliente,
+                'autonomia': autonomia
+            }
+            cumplimiento = calcular_cumplimiento_kpi(kpi_data)
+            
+            # Preparar para guardar
+            kpi_data['semana'] = monday.isoformat()
+            kpi_data['persona'] = persona
+            kpi_data['cumplimiento_kpi'] = cumplimiento
+            
+            if save_kpi_to_db(kpi_data):
+                st.success(f"✓ KPIs guardados para {persona}")
+                st.balloons()
+            else:
+                st.error("Error al guardar KPIs")
+
+
+def historico_kpis() -> None:
+    """Vista de histórico de KPIs"""
+    st.markdown("### 📅 Histórico de KPIs")
+    
+    # Filtros
+    col1, col2 = st.columns(2)
+    with col1:
+        periodo = st.selectbox("Período", ["Semana", "Mes", "Trimestre", "Año"])
+    with col2:
+        if periodo == "Semana":
+            weeks_back = st.number_input("Semanas atrás", min_value=1, max_value=52, value=4)
+            end_date = date.today()
+            start_date = end_date - timedelta(weeks=weeks_back)
+        elif periodo == "Mes":
+            months_back = st.number_input("Meses atrás", min_value=1, max_value=12, value=3)
+            end_date = date.today()
+            start_date = end_date - timedelta(days=months_back*30)
+        elif periodo == "Trimestre":
+            quarter = st.selectbox("Trimestre", ["Q1", "Q2", "Q3", "Q4"])
+            year = st.number_input("Año", min_value=2020, max_value=2030, value=date.today().year)
+            q_start = {"Q1": 1, "Q2": 4, "Q3": 7, "Q4": 10}[quarter]
+            start_date = date(year, q_start, 1)
+            end_date = start_date + timedelta(days=90)
+        else:  # Año
+            year = st.number_input("Año", min_value=2020, max_value=2030, value=date.today().year)
+            start_date = date(year, 1, 1)
+            end_date = date(year, 12, 31)
+    
+    # Cargar datos
+    kpis_df = load_kpis_from_db(start_date, end_date)
+    
+    if kpis_df.empty:
+        st.warning("No hay datos de KPI para el período seleccionado")
+        return
+    
+    # Seleccionar persona
+    persona_filtro = st.selectbox("Persona", ["Todos"] + JEFES_PROYECTO)
+    
+    if persona_filtro != "Todos":
+        kpis_df = kpis_df[kpis_df['persona'] == persona_filtro]
+    
+    # Gráficos de tendencia
+    st.subheader("📈 Tendencias")
+    
+    # Gráfico de Cumplimiento KPI
+    chart = alt.Chart(kpis_df).mark_line(point=True).encode(
+        x=alt.X('semana:T', title='Fecha'),
+        y=alt.Y('cumplimiento_kpi:Q', title='Cumplimiento KPI (%)', scale=alt.Scale(domain=[0, 100])),
+        color='persona:N',
+        tooltip=['persona', 'semana', 'cumplimiento_kpi']
+    ).properties(height=300)
+    st.altair_chart(chart, use_container_width=True)
+    
+    # Gráfico de Autonomía
+    chart_autonomia = alt.Chart(kpis_df).mark_line(point=True).encode(
+        x=alt.X('semana:T', title='Fecha'),
+        y=alt.Y('autonomia:Q', title='Autonomía (%)', scale=alt.Scale(domain=[0, 100])),
+        color='persona:N',
+        tooltip=['persona', 'semana', 'autonomia']
+    ).properties(height=300)
+    st.altair_chart(chart_autonomia, use_container_width=True)
+    
+    # Tabla histórica
+    st.subheader("📋 Datos Históricos")
+    display_df = kpis_df[['semana', 'persona', 'felicitaciones', 'reclamos', 'orden', 'autonomia', 'respuesta_cliente', 'cumplimiento_kpi']].copy()
+    display_df['semana'] = pd.to_datetime(display_df['semana']).dt.strftime('%d/%m/%Y')
+    st.dataframe(display_df, hide_index=True, use_container_width=True)
+
+
+# ============================================================================
 # VISTA JEFE DE PROYECTO
 # ============================================================================
 
@@ -593,7 +1262,7 @@ def jp_view(nombre: str, df: pd.DataFrame) -> None:
                         "descripcion": descripcion.strip(),
                         "fecha_objetivo": fecha_objetivo,
                         "estado": estado,
-                        "autor": st.session_state.user_info["nombre"],  # Autor automático
+                        "autor": st.session_state.user_info["nombre"],
                         "asignado": asignado,
                         "cliente": cliente.strip(),
                         "comentarios": []
@@ -869,7 +1538,12 @@ def main() -> None:
         # Menú dinámico
         menu_options = ["Dashboard Gerencia"]
         
-        # Agregar opción personal para Jefes de Proyecto
+        # Opciones para Gerentes
+        if es_gerente():
+            menu_options.append("Gestión de Tareas")
+            menu_options.append("KPI Gerencial")
+        
+        # Opción personal para Jefes de Proyecto
         if st.session_state.user_info["rol"] == "Jefe de Proyecto":
             menu_options.append(st.session_state.user_info["nombre"])
         
@@ -878,12 +1552,43 @@ def main() -> None:
         st.divider()
         st.caption(f"Total de tareas: {len(st.session_state.tasks)}")
         
+        # Cambiar contraseña
+        with st.expander("🔑 Cambiar contraseña"):
+            with st.form("change_password_form"):
+                current_pwd = st.text_input("Contraseña actual", type="password")
+                new_pwd = st.text_input("Nueva contraseña", type="password")
+                confirm_pwd = st.text_input("Confirmar nueva contraseña", type="password")
+                
+                if st.form_submit_button("Actualizar contraseña"):
+                    if not current_pwd or not new_pwd or not confirm_pwd:
+                        st.error("Todos los campos son obligatorios")
+                    elif new_pwd != confirm_pwd:
+                        st.error("Las contraseñas nuevas no coinciden")
+                    elif len(new_pwd) < 6:
+                        st.error("La contraseña debe tener al menos 6 caracteres")
+                    else:
+                        success, message = cambiar_contraseña(
+                            st.session_state.username,
+                            current_pwd,
+                            new_pwd
+                        )
+                        if success:
+                            st.success(message)
+                        else:
+                            st.error(message)
+        
+        st.divider()
+        
         if st.button("🚪 Cerrar Sesión", use_container_width=True):
             logout()
     
     # Renderizar vista según selección
     if option == "Dashboard Gerencia":
         dashboard_gerencia(df)
+    elif option == "Gestión de Tareas":
+        gestion_tareas_gerentes(df)
+    elif option == "KPI Gerencial":
+        kpi_gerencial()
     else:
         jp_view(option, df)
 
